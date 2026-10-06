@@ -118,9 +118,14 @@ def _request_part_text(part: ModelRequestPart) -> list[str]:
     # Match the discriminator so this remains importable before the new core part is released.
     elif part.part_kind == 'instruction-delta':  # pyright: ignore[reportUnnecessaryComparison]
         return [part.render()]  # pragma: lax no cover - requires core instruction updates
-    elif isinstance(part, (ToolReturnPart, RetryPromptPart)):
-        # Both are sent in full. The tool-search and capability-load returns subclass
-        # `ToolReturnPart`, so they arrive here too.
+    elif isinstance(part, ToolReturnPart):
+        # Sent in full. The tool-search and capability-load returns subclass `ToolReturnPart`, so
+        # they arrive here too. Count the data the model reads as text, not the multimodal files
+        # (`BinaryContent`, `ImageUrl`, ...) a tool may return alongside it: as with
+        # `UserPromptPart`, a file has no character-count meaning, and `str()` of a screenshot's
+        # `BinaryContent` is the repr of its bytes -- a 1.5 MB PNG would count as ~1M tokens.
+        return [part.model_response_str()]
+    elif isinstance(part, RetryPromptPart):
         return [str(part.content)]
     # Control bookkeeping rather than message text: it records which tools became available, and
     # the schemas themselves travel in the request's tool definitions. Those schemas are not free

@@ -201,6 +201,22 @@ class TestEstimateTokenCount:
         ]
         assert estimate_token_count(msgs) > 0
 
+    def test_tool_return_files_are_not_counted_as_text(self):
+        # A screenshot returned by a tool, as pydantic-ai recommends returning multimodal content:
+        # its text counts, its bytes do not (as in `UserPromptPart`), so one image does not look
+        # like a million tokens and trigger compaction.
+        png = BinaryContent(data=b'\x89PNG\r\n\x1a\n' + bytes(range(256)) * 5_700, media_type='image/png')
+        assert len(png.data) > 1_450_000
+        text = 'x' * 400
+        msgs: list[ModelMessage] = [
+            ModelRequest(parts=[ToolReturnPart(tool_name='view', content=[text, png], tool_call_id='tc1')]),
+        ]
+        assert estimate_token_count(msgs) == len(text) // 4
+        only_file: list[ModelMessage] = [
+            ModelRequest(parts=[ToolReturnPart(tool_name='view', content=png, tool_call_id='tc1')])
+        ]
+        assert estimate_token_count(only_file) == 0
+
 
 # ---------------------------------------------------------------------------
 # estimate_context_tokens
