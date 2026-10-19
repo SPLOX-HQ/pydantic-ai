@@ -9,6 +9,7 @@ from dataclasses import KW_ONLY, InitVar, dataclass, field
 from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never, cast
 
+import pydantic_core
 from pydantic import TypeAdapter, ValidationError
 
 from pydantic_ai._utils import is_str_dict as _is_str_dict
@@ -126,6 +127,7 @@ from .request_types import (
     ToolApprovalRequestedPart,
     ToolApprovalResponded,
     ToolInputAvailablePart,
+    ToolInputStreamingPart,
     ToolOutputAvailablePart,
     ToolOutputDeniedPart,
     ToolOutputErrorPart,
@@ -862,6 +864,10 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                             part_canonical_system(msg, part.provider_name),
                         )
                     )
+                case ToolCallPart() if msg.state == 'incomplete' and part.tool_call_id not in tool_results:
+                    ui_parts.append(
+                        _dump_streaming_tool_call_part(part, part_canonical_system(msg, part.provider_name))
+                    )
                 case ToolCallPart():
                     ui_parts.extend(
                         cls._dump_tool_call_part(
@@ -882,6 +888,9 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                 case _:
                     assert_never(part)
 
+        if msg.state == 'incomplete' and ui_parts and isinstance(ui_parts[-1], TextUIPart | ReasoningUIPart):
+            # The part a response still in flight is streaming into, as the AI SDK holds it mid-stream.
+            ui_parts[-1].state = 'streaming'
         return _with_text_citations(ui_parts, text_runs, msg)
 
     @classmethod
@@ -1225,6 +1234,44 @@ class VercelAIAdapter(UIAdapter[RequestData, UIMessage, BaseChunk, AgentDepsT, O
                 ui_message.metadata = request_metadata
             ui_messages.append(ui_message)
         return ui_messages
+
+
+def _dump_streaming_tool_call_part(part: ToolCallPart, canonical_system: str | None) -> UIMessagePart:
+    """A call of a response still in flight (`ModelResponse.state == 'incomplete'`), as the AI SDK holds it
+    mid-stream: arguments that are not a whole JSON object yet are `input-streaming`, their partial parse the
+    input; whole ones are `input-available` (no approval is requested before the response ends)."""
+    call_provider_metadata = dump_provider_metadata(
+        id=part.id,
+        provider_name=part.provider_name,
+        provider_details=part.provider_details,
+        canonical_system=canonical_system,
+        tool_kind=part.tool_kind,
+    )
+    args = part.args
+    if isinstance(args, str):
+        try:
+            whole = json.loads(args or '{}')
+        except ValueError:
+            whole = None
+        if not isinstance(whole, dict):
+            try:
+                partial = pydantic_core.from_json(args, allow_partial='trailing-strings') if args else None
+            except ValueError:
+                partial = None
+            return ToolInputStreamingPart(
+                type=f'tool-{part.tool_name}',
+                tool_call_id=part.tool_call_id,
+                input=partial,
+                provider_executed=False,
+                call_provider_metadata=call_provider_metadata,
+            )
+    return ToolInputAvailablePart(
+        type=f'tool-{part.tool_name}',
+        tool_call_id=part.tool_call_id,
+        input=part.args_as_dict(),
+        provider_executed=False,
+        call_provider_metadata=call_provider_metadata,
+    )
 
 
 def _with_text_citations(
