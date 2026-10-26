@@ -44,6 +44,7 @@ __all__ = (
     'ConcurrencyLimitExceeded',
     'ModelAPIError',
     'ModelHTTPError',
+    'ContextWindowExceeded',
     'ContentFilterError',
     'IncompleteToolCall',
     'MessageHistoryMutatedWarning',
@@ -609,6 +610,18 @@ class ModelHTTPError(ModelAPIError):
             return max(0.0, wait)
         except (ValueError, TypeError, AssertionError):
             return None
+
+
+class ContextWindowExceeded(ModelHTTPError):
+    """Raised when the provider refused a request for being over the model's context window.
+
+    Each model class raises it from the provider's own sign of it -- OpenAI's error code
+    `context_length_exceeded`, Anthropic's `prompt is too long`, Google's `The input token count ...
+    exceeds the maximum` -- in place of a plain [`ModelHTTPError`][pydantic_ai.exceptions.ModelHTTPError].
+    A request the provider counts over the window is refused as long as its history is not made
+    shorter, so retrying it as it is never helps; a compaction capability catches it to make the
+    request again on a compacted history.
+    """
 
 
 class FallbackExceptionGroup(ExceptionGroup[Any]):

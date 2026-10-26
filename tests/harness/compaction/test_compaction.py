@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -15,7 +16,7 @@ import pydantic_ai_harness
 import pydantic_ai_harness.compaction as compaction
 from pydantic_ai import Agent, Tool
 from pydantic_ai.capabilities import AbstractCapability, ToolSearch
-from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.exceptions import ContextWindowExceeded, ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
     AgentStreamEvent,
     BinaryContent,
@@ -2102,6 +2103,97 @@ class TestTieredCompaction:
         assert isinstance(first_msg, ModelRequest)
         sys_parts = [p for p in first_msg.parts if isinstance(p, SystemPromptPart)]
         assert any('Tiered summary.' in p.content for p in sys_parts)
+
+
+class TestTieredCompactionOnContextWindowExceeded:
+    """The provider's count decides: a request it refuses as over the window is made again on the
+    history every tier compacted, and that history is the run's from then on."""
+
+    @staticmethod
+    def _history(n: int) -> list[ModelMessage]:
+        history: list[ModelMessage] = []
+        for i in range(n):
+            history += [_user(f'question {i}'), _assistant(f'answer {i}')]
+        return history
+
+    @staticmethod
+    def _refused(model_name: str) -> ContextWindowExceeded:
+        body = {'message': 'too many tokens', 'type': 'invalid_request_error', 'code': 'context_length_exceeded'}
+        return ContextWindowExceeded(status_code=400, model_name=model_name, body=body)
+
+    @pytest.mark.parametrize('stream', [False, True])
+    async def test_made_again_on_the_compacted_history(self, stream: bool):
+        calls: list[str] = []
+        sent: list[int] = []
+
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            sent.append(len(messages))
+            if len(messages) > 3:
+                raise self._refused('function')
+            return ModelResponse(parts=[TextPart('fits')])
+
+        async def stream_answer(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+            yield 'fits'
+
+        class Refusing(FunctionModel):
+            """A provider's stream: refused as it is opened, as the provider answers the request."""
+
+            @asynccontextmanager
+            async def request_stream(self, messages: list[ModelMessage], *args: Any, **kwargs: Any):
+                answer(messages, None)  # type: ignore[arg-type]
+                async with super().request_stream(messages, *args, **kwargs) as streamed:
+                    yield streamed
+
+        # The estimate is far under the target: only the provider says the history is too long.
+        cap = TieredCompaction(tiers=[_RecordingTier('t1', calls, drop=8)], target_tokens=1_000_000)
+        agent = Agent(Refusing(answer, stream_function=stream_answer), capabilities=[cap])
+        events: list[Any] = []
+
+        async def handle(ctx: RunContext[None], stream: AsyncIterable[Any]) -> None:
+            async for event in stream:
+                events.append(event)
+
+        run = await agent.run('now', message_history=self._history(5), event_stream_handler=handle if stream else None)
+        assert run.output == 'fits'
+        messages = run.all_messages()
+        assert calls == ['t1']
+        assert sent == [11, 3]
+        # the run's history is the compacted one: the next request is measured from it
+        assert _user_texts(messages) == ['question 4', 'now']
+
+    async def test_refused_again_raises_the_refusal(self):
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            raise self._refused('function')
+
+        cap = TieredCompaction(tiers=[_RecordingTier('t1', [], drop=8)], target_tokens=1_000_000)
+        agent = Agent(FunctionModel(answer), capabilities=[cap])
+        with pytest.raises(ContextWindowExceeded):
+            await agent.run('now', message_history=self._history(5))
+
+    async def test_a_history_no_tier_shortens_raises_the_refusal(self):
+        sent: list[int] = []
+
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            sent.append(len(messages))
+            raise self._refused('function')
+
+        cap = TieredCompaction(tiers=[_RecordingTier('t1', [])], target_tokens=1_000_000)
+        agent = Agent(FunctionModel(answer), capabilities=[cap])
+        with pytest.raises(ContextWindowExceeded):
+            await agent.run('now', message_history=self._history(5))
+        assert sent == [11]  # not made again on the same history
+
+    async def test_other_refusals_are_not_compacted_for(self):
+        calls: list[str] = []
+
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            raise ModelHTTPError(status_code=400, model_name='function', body={'code': 'invalid_value'})
+
+        cap = TieredCompaction(tiers=[_RecordingTier('t1', calls, drop=8)], target_tokens=1_000_000)
+        agent = Agent(FunctionModel(answer), capabilities=[cap])
+        with pytest.raises(ModelHTTPError):
+            await agent.run('now', message_history=self._history(5))
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------

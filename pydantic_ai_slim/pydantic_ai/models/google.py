@@ -15,7 +15,7 @@ from typing_extensions import assert_never
 
 from .. import UnexpectedModelBehavior, _utils, usage
 from .._run_context import RunContext
-from ..exceptions import ModelAPIError, ModelHTTPError, UserError
+from ..exceptions import ContextWindowExceeded, ModelAPIError, ModelHTTPError, UserError
 from ..messages import (
     BinaryContent,
     CachePoint,
@@ -413,6 +413,18 @@ def _map_api_error(e: errors.APIError, model_name: str, model_id_namespace: str 
                 and message.startswith(f'models/{model_name} is not found ')
             ):
                 suggested_model_id = _suggest_known_model_id_from_provider_error(model_id_namespace, model_name)
+            if (
+                error.get('status') == 'INVALID_ARGUMENT'
+                and isinstance(message, str)
+                and message.startswith('The input token count')
+                and 'exceeds the maximum number of tokens allowed' in message
+            ):
+                return ContextWindowExceeded(
+                    status_code=status_code,
+                    model_name=model_name,
+                    body=cast(Any, e.details),  # pyright: ignore[reportUnknownMemberType]
+                    headers=headers,
+                )
         return ModelHTTPError(
             status_code=status_code,
             model_name=model_name,

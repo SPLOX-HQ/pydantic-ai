@@ -6,8 +6,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from pydantic_ai.agent import ModelRequestNode
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.exceptions import ContextWindowExceeded
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW
 from pydantic_ai_harness.compaction._pinning import reinject_pinned
@@ -24,6 +26,7 @@ from pydantic_ai_harness.compaction._shared import (
 )
 
 if TYPE_CHECKING:
+    from pydantic_ai.capabilities.abstract import AgentNode, NodeResult
     from pydantic_ai.models import AbstractModel, ModelRequestContext, ModelRequestParameters
 
 
@@ -38,6 +41,14 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
 
     Each tier's own trigger is bypassed -- `TieredCompaction` drives the tiers directly via
     their `compact` method and decides when to stop.
+
+    The target is measured on an estimate, and the provider's count is the one that decides: a
+    request the provider refuses as over the model's context window
+    ([`ContextWindowExceeded`][pydantic_ai.exceptions.ContextWindowExceeded]) is made once more on
+    the history every tier compacted, which becomes the run's history. This holds however the run
+    is driven but for the final request of `agent.run_stream()`, which the agent hands back mid-stream
+    rather than through the node hooks. A request that is refused
+    again, or a history no tier can make shorter, raises the provider's refusal.
 
     Example:
         ```python
@@ -212,3 +223,42 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         )
         request_context.messages = compacted
         return request_context
+
+    async def on_node_run_error(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        node: AgentNode[AgentDepsT],
+        error: Exception,
+    ) -> NodeResult[AgentDepsT]:
+        """Run a model request the provider refused as over the window again, every tier applied.
+
+        A node, not a request hook: a streamed request is refused as its stream is opened, which
+        is in the node's run (and, durably, in its step) rather than in `wrap_model_request`.
+        """
+        if not isinstance(error, ContextWindowExceeded) or not isinstance(node, ModelRequestNode):
+            raise error
+        # `ctx.messages` is the run's history, by reference: the refused request is in it, with
+        # whatever the refusal left after it (a streamed one's empty response).
+        history = ctx.messages
+        at = next((i for i in range(len(history) - 1, -1, -1) if history[i] is node.request), None)
+        if at is None:
+            raise error
+        messages = history[: at + 1]
+        compacted = await compact_with_span(
+            ctx,
+            strategy='TieredCompaction',
+            messages=messages,
+            # A target of 0: no estimate stops the escalation, since the estimate is what was wrong.
+            compact=lambda: self._escalate(messages, ctx, 0),
+            tokenizer=self.tokenizer,
+        )
+        request = compacted[-1] if compacted else None
+        if not isinstance(request, ModelRequest) or estimate_token_count(
+            compacted, self.tokenizer
+        ) >= estimate_token_count(messages, self.tokenizer):
+            raise error
+        # The compacted history is the run's: the next request is measured from it, rather than
+        # refused and compacted again. The node appends its request, which a tier may have rewritten.
+        history[:] = compacted[:-1]
+        return replace(node, request=request)

@@ -25,7 +25,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_core import to_json
 from typing_extensions import Never, Protocol, Self, TypedDict, assert_never
 
-from .. import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior, _utils, usage
+from .. import ContextWindowExceeded, ModelAPIError, ModelHTTPError, UnexpectedModelBehavior, _utils, usage
 from .._http import to_httpx2_timeout
 from .._instrumentation import get_instructions
 from .._output import DEFAULT_OUTPUT_TOOL_NAME
@@ -232,6 +232,10 @@ def _map_api_errors(model_name: str, model_id_namespace: str = 'openai') -> Gene
             suggested_model_id = None
             if _utils.is_str_dict(body) and body.get('code') == 'model_not_found':
                 suggested_model_id = _suggest_known_model_id_from_provider_error(model_id_namespace, model_name)
+            if _utils.is_str_dict(body) and body.get('code') == 'context_length_exceeded':
+                raise ContextWindowExceeded(
+                    status_code=status_code, model_name=model_name, body=body, headers=dict(e.response.headers)
+                ) from e
             raise ModelHTTPError(
                 status_code=status_code,
                 model_name=model_name,
