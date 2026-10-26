@@ -2877,6 +2877,41 @@ class TestSummarizingCompactionModel:
         assert mock_agent_instance.run.call_args.kwargs['usage'] is ctx.usage
         assert mock_agent_instance.run.call_args.kwargs['event_stream_handler'] is None
 
+    async def test_a_durable_runs_request_model_is_summarized_with_under_its_wrapper(self):
+        # Inside a durable run the request's model is the run's `DurableModel`, whose segments are
+        # units of the run's own request: a summary streamed through it reached the run's event
+        # stream handler as the run's response. The summary is its own durable operation.
+        from pydantic_ai.durable_exec._utils import DurableModel
+
+        comp = SummarizingCompaction(
+            max_messages=3, keep_messages=1, preserve_first_user_message=False, incremental=False
+        )
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+        rc = _make_request_context(messages)
+        inner = FunctionModel(_summary_response)
+
+        async def unit(*_: Any) -> Any:
+            raise AssertionError("the summary went through the run's request unit")
+
+        rc.model = DurableModel(
+            inner,
+            request_segment=unit,
+            request_stream_segment=unit,
+            compact_messages_segment=unit,
+            cancel_suspended_response_segment=unit,
+        )
+        ctx = _make_ctx(messages)
+
+        mock_result = AsyncMock()
+        mock_result.output = 'Summary under the wrapper.'
+        with patch('pydantic_ai.Agent') as MockAgent:
+            mock_agent_instance = AsyncMock()
+            mock_agent_instance.run.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+            await comp.before_model_request(ctx, rc)
+
+        assert MockAgent.call_args.args[0] is inner
+
     async def test_nested_summary_reserves_parent_usage_limits(self):
         comp = SummarizingCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)
         messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]

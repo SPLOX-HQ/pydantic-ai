@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard, cast
 from pydantic_ai._utils import is_str_dict
 from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.capabilities import AbstractCapability, durable_operation
+from pydantic_ai.durable_exec._utils import DurableModel
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -948,6 +949,13 @@ async def write_summary(
         )
 
     model = summarizer.model if summarizer.model is not None else ctx.model
+    # Inside a durable run the request's model is the run's `DurableModel`, installed before the
+    # before-hook chain this runs from. Its segments are units of the run's own model request, bound
+    # to the run's context: a streamed summary through it reaches the run's event stream handler as
+    # if it were the run's response. The summary is a durable operation of its own (`summarize`),
+    # so it calls the model under that wrapper.
+    if isinstance(model, DurableModel):
+        model = model.wrapped
     # `ctx.model` is an `AbstractModel`; summarization needs a request-response model. A
     # realtime run reaches here only when no summarizer `model=` was configured, so ask for
     # one explicitly rather than handing `Agent` a model it cannot run with.
