@@ -3990,6 +3990,57 @@ async def test_connect_reconnect_retries_a_redial_that_exceeds_handshake_timeout
     assert events[1:3] == [OutputTranscript(text='back', is_final=True), ResponseDone(interrupted=False)]
 
 
+async def test_connect_reconnect_retries_a_redial_whose_upgrade_was_refused() -> None:
+    # A re-dial answered with an HTTP status instead of the upgrade -- a proxy's `502` while the gateway
+    # behind it restarts -- reaches the receive loop as a raw `websockets.InvalidStatus`. It is a failed
+    # attempt the reconnect policy retries, like any other dial that did not come up, not an error of
+    # the session's.
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    dials: list[str] = []
+
+    class _Connect:
+        def __init__(self, session: _RecordingSession | None) -> None:
+            self._session = session
+
+        async def __aenter__(self) -> _RecordingSession:
+            if self._session is None:
+                dials.append('refused')
+                raise InvalidStatus(Response(502, 'Bad Gateway', Headers(), body=b''))
+            dials.append('opened')
+            return self._session
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    connects = iter([_RecordingSession([]), None, None, _RecordingSession([[_turn('back')]])])
+
+    class _Live:
+        def connect(self, *, model: str, config: Any) -> _Connect:
+            try:
+                return _Connect(next(connects))
+            except StopIteration:
+                raise ConnectionClosed(None, None)
+
+    client = cast(
+        'Client',
+        type('_C', (), {'aio': type('_A', (), {'live': _Live()})(), '_api_client': _ApiClient(), 'vertexai': False})(),
+    )
+    model = GoogleRealtimeModel(
+        'gemini-2.5-flash-native-audio-latest',
+        provider=GoogleProvider(client=client),
+        settings=GoogleRealtimeModelSettings(reconnect={'base_delay': 0.0, 'max_attempts': 3, 'jitter': False}),
+    )
+    async with _connect(model, 'x') as conn:
+        events = [e async for e in conn]
+
+    assert dials == ['opened', 'refused', 'refused', 'opened']
+    assert isinstance(events[0], RealtimeSessionReconnectEvent)
+    assert events[1:3] == [OutputTranscript(text='back', is_final=True), ResponseDone(interrupted=False)]
+
+
 @pytest.mark.parametrize(
     ('model_name', 'settings', 'expected'),
     [

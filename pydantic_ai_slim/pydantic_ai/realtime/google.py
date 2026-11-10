@@ -2204,10 +2204,12 @@ class GoogleRealtimeConnection(RealtimeConnection):
             else:
                 # Passed on its own, so a `dial` from before `replay` existed keeps working here.
                 self._session = await self._dial(self._resumption_handle)
-        except (genai_errors.APIError, ConnectionClosed, OSError, TimeoutError):
-            # Expected dial failures: SDK-reported API errors, a closed socket, and network/timeout
-            # errors. A retry may still succeed. Anything else is a bug in `dial()` and propagates
-            # rather than masquerading as a failed reconnect.
+        except (genai_errors.APIError, ConnectionClosed, websockets.WebSocketException, OSError, TimeoutError):
+            # Expected dial failures: SDK-reported API errors, a closed socket, a handshake the server
+            # or a proxy in front of it refused (`google-genai` lets a rejected upgrade out as a raw
+            # `websockets` error: a `502` while a gateway restarts), and network/timeout errors. A retry
+            # may still succeed, as on the OpenAI-protocol providers. Anything else is a bug in `dial()`
+            # and propagates rather than masquerading as a failed reconnect.
             return False
         return True
 
